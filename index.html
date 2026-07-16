@@ -801,18 +801,28 @@
   // Fallback: localStorage, used automatically when window.storage isn't available
   // (file downloaded and opened directly, hosted elsewhere, or a call fails) —
   // this keeps the app working, and data on this machine, either way.
-  const hasClaudeStorage = (typeof window.storage !== 'undefined'
+  // The fallback is "sticky": once window.storage fails once, we stop retrying it
+  // for the rest of this session, so a broken/unavailable backend doesn't cause a
+  // repeated failed round-trip (and a repeated console warning) on every save/load.
+  let claudeStorageAvailable = (typeof window.storage !== 'undefined'
     && typeof window.storage.get === 'function'
     && typeof window.storage.set === 'function');
 
+  function fallBackToLocalStorage(reason){
+    if(claudeStorageAvailable){
+      claudeStorageAvailable = false;
+      console.warn('window.storage is unavailable this session — switching to localStorage for the rest of this session:', reason);
+    }
+  }
+
   const storageBackend = {
     async get(key){
-      if(hasClaudeStorage){
+      if(claudeStorageAvailable){
         try{
           const r = await window.storage.get(key, false);
           return r || null;
         }catch(e){
-          console.warn('window.storage.get failed, falling back to localStorage:', e);
+          fallBackToLocalStorage(e);
         }
       }
       try{
@@ -824,12 +834,13 @@
       }
     },
     async set(key, value){
-      if(hasClaudeStorage){
+      if(claudeStorageAvailable){
         try{
           const r = await window.storage.set(key, value, false);
           if(r) return r;
+          fallBackToLocalStorage('empty response from window.storage.set');
         }catch(e){
-          console.warn('window.storage.set failed, falling back to localStorage:', e);
+          fallBackToLocalStorage(e);
         }
       }
       try{
