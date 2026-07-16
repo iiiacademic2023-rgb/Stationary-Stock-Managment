@@ -620,6 +620,15 @@
 
     <!-- BACKUP / EXPORT / IMPORT -->
     <section id="tab-backup" class="tab-panel" style="display:none;">
+      <div class="card" id="autosaveCard">
+        <h3>Auto-Save to a Folder</h3>
+        <div class="value-line">Connect a folder on this computer — for example one synced by Google Drive Desktop — and every change here will be saved there automatically, with no manual export needed.</div>
+        <div id="autosaveStatus" style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;"></div>
+        <button class="btn green auto" id="btnConnectFolder">Connect Folder (Auto-Save)</button>
+        <button class="btn outline auto" id="btnReconnectFolder" style="display:none;">Reconnect Folder</button>
+        <button class="btn outline auto" id="btnDisconnectFolder" style="display:none;margin-left:8px;">Disconnect</button>
+        <div class="value-line" id="autosaveUnsupportedMsg" style="display:none;border-bottom:none;padding-bottom:0;margin-top:10px;">This browser doesn't support connecting to a folder — try Chrome or Edge on a computer. You can still use manual Export/Import below.</div>
+      </div>
       <div class="grid-2">
         <div class="card">
           <h3>Export Your Data</h3>
@@ -1055,10 +1064,182 @@
     try{
       await storageBackend.set(STATE_KEY, JSON.stringify({ items, transactions, appMeta }));
     }catch(e){ console.error('Saving state failed:', e); }
+    writeAutosaveFile(); // fire-and-forget; no-op if no folder is connected
   }
   // Thin backward-compatible wrappers so all existing call sites keep working unchanged.
   async function saveItems(){ await saveState(); }
   async function saveTx(){ await saveState(); }
+
+  // ---------- Auto-save to a connected local folder (File System Access API) ----------
+  // Lets a folder synced by something like Google Drive Desktop stay up to date
+  // automatically, without a manual Export/Import round trip each time.
+  const AUTOSAVE_FILENAME = 'stock_register_autosave.json';
+  const autosaveSupported = ('showDirectoryPicker' in window);
+  let autosaveDirHandle = null;
+
+  // Minimal IndexedDB key-value store, just to remember the chosen folder handle
+  // across page reloads (window.storage/localStorage can only hold plain JSON,
+  // not a live handle to a folder on disk).
+  const IDB_NAME = 'stockRegisterFS';
+  const IDB_STORE = 'handles';
+  function idbOpen(){
+    return new Promise((resolve, reject)=>{
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = ()=>{ req.result.createObjectStore(IDB_STORE); };
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror = ()=>reject(req.error);
+    });
+  }
+  async function idbSet(key, value){
+    const db = await idbOpen();
+    return new Promise((resolve, reject)=>{
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+  }
+  async function idbGet(key){
+    const db = await idbOpen();
+    return new Promise((resolve, reject)=>{
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror = ()=>reject(req.error);
+    });
+  }
+  async function idbDelete(key){
+    const db = await idbOpen();
+    return new Promise((resolve, reject)=>{
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(key);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>reject(tx.error);
+    });
+  }
+
+  async function verifyDirPermission(handle, requestIfNeeded){
+    const opts = { mode: 'readwrite' };
+    try{
+      if((await handle.queryPermission(opts)) === 'granted') return true;
+      if(requestIfNeeded && (await handle.requestPermission(opts)) === 'granted') return true;
+    }catch(e){ console.warn('Checking folder permission failed:', e); }
+    return false;
+  }
+
+  function updateAutosaveUI(state, folderName){
+    const connectBtn = document.getElementById('btnConnectFolder');
+    const reconnectBtn = document.getElementById('btnReconnectFolder');
+    const disconnectBtn = document.getElementById('btnDisconnectFolder');
+    const statusEl = document.getElementById('autosaveStatus');
+    if(state === 'connected'){
+      connectBtn.style.display = 'none';
+      reconnectBtn.style.display = 'none';
+      disconnectBtn.style.display = 'inline-block';
+      statusEl.textContent = `Connected to "${folderName}" — saving automatically on every change.`;
+    }else if(state === 'needs-permission'){
+      connectBtn.style.display = 'none';
+      reconnectBtn.style.display = 'inline-block';
+      disconnectBtn.style.display = 'inline-block';
+      statusEl.textContent = `Was connected to "${folderName}", but the browser needs permission confirmed again — click "Reconnect Folder".`;
+    }else{
+      connectBtn.style.display = 'inline-block';
+      reconnectBtn.style.display = 'none';
+      disconnectBtn.style.display = 'none';
+      statusEl.textContent = 'Not connected — using manual Export/Import below.';
+    }
+  }
+
+  async function writeAutosaveFile(){
+    if(!autosaveDirHandle) return;
+    try{
+      const ok = await verifyDirPermission(autosaveDirHandle, false);
+      if(!ok){
+        updateAutosaveUI('needs-permission', autosaveDirHandle.name);
+        return;
+      }
+      const fileHandle = await autosaveDirHandle.getFileHandle(AUTOSAVE_FILENAME, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(JSON.stringify(buildBackupPayload(), null, 2));
+      await writable.close();
+      const statusEl = document.getElementById('autosaveStatus');
+      if(statusEl) statusEl.textContent = `Connected to "${autosaveDirHandle.name}" — last auto-saved at ${currentTimeStr()}.`;
+    }catch(e){
+      console.error('Auto-save write failed:', e);
+    }
+  }
+
+  async function connectAutosaveFolder(){
+    if(!autosaveSupported){
+      await customAlert('Auto-save to a folder needs Chrome or Edge on a computer. This browser doesn\'t support it — you can still use manual Export/Import.');
+      return;
+    }
+    try{
+      const handle = await window.showDirectoryPicker();
+      const ok = await verifyDirPermission(handle, true);
+      if(!ok){
+        await customAlert('Permission was not granted, so auto-save could not be turned on.');
+        return;
+      }
+      autosaveDirHandle = handle;
+      await idbSet('autosaveDir', handle);
+      updateAutosaveUI('connected', handle.name);
+      await writeAutosaveFile();
+      await customAlert(`Connected to folder "${handle.name}". From now on, every change will be saved there automatically.`);
+    }catch(e){
+      if(e.name !== 'AbortError'){
+        console.error('Connect folder failed:', e);
+        await customAlert('Could not connect to a folder. Please try again.');
+      }
+    }
+  }
+
+  async function reconnectAutosaveFolder(){
+    if(!autosaveDirHandle) return;
+    const ok = await verifyDirPermission(autosaveDirHandle, true);
+    if(ok){
+      updateAutosaveUI('connected', autosaveDirHandle.name);
+      await writeAutosaveFile();
+    }else{
+      await customAlert('Permission was not granted, so auto-save is still off for this folder.');
+    }
+  }
+
+  async function disconnectAutosaveFolder(){
+    const ok = await customConfirm('Stop auto-saving to this folder? You can still use manual Export/Import afterwards.');
+    if(!ok) return;
+    autosaveDirHandle = null;
+    await idbDelete('autosaveDir');
+    updateAutosaveUI('disconnected');
+  }
+
+  async function initAutosave(){
+    if(!autosaveSupported){
+      document.getElementById('btnConnectFolder').style.display = 'none';
+      document.getElementById('autosaveUnsupportedMsg').style.display = 'block';
+      return;
+    }
+    try{
+      const handle = await idbGet('autosaveDir');
+      if(handle){
+        autosaveDirHandle = handle;
+        // Don't auto-request permission on load — browsers require a user gesture
+        // for that — just check the current state and prompt the person to
+        // reconnect with one click if it's no longer granted.
+        const granted = await verifyDirPermission(handle, false);
+        updateAutosaveUI(granted ? 'connected' : 'needs-permission', handle.name);
+      }else{
+        updateAutosaveUI('disconnected');
+      }
+    }catch(e){
+      console.warn('Could not restore auto-save folder:', e);
+      updateAutosaveUI('disconnected');
+    }
+  }
+
+  document.getElementById('btnConnectFolder').addEventListener('click', connectAutosaveFolder);
+  document.getElementById('btnReconnectFolder').addEventListener('click', reconnectAutosaveFolder);
+  document.getElementById('btnDisconnectFolder').addEventListener('click', disconnectAutosaveFolder);
 
   document.getElementById('tabs').addEventListener('click', (e)=>{
     const btn = e.target.closest('.tab-btn');
@@ -2429,6 +2610,7 @@
   });
 
   loadAll();
+  initAutosave();
 
   // Real offline support via a separate sw.js (same directory as this file when hosted).
   // Guarded to https/localhost since service workers require a secure context; silent
